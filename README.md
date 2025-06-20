@@ -84,6 +84,8 @@
 
 ## 运行爬虫程序
 
+### 传统模式
+
    ```shell
    ### 项目默认是没有开启评论爬取模式，如需评论请在config/base_config.py中的 ENABLE_GET_COMMENTS 变量修改
    ### 一些其他支持项，也可以在config/base_config.py查看功能，写的有中文注释
@@ -97,8 +99,34 @@
    # 打开对应APP扫二维码登录
      
    # 其他平台爬虫使用示例，执行下面的命令查看
-   python main.py --help    
+   python main.py --help
    ```
+   
+### 调度器模式
+
+   ```shell
+   # 1. 初次使用需先创建任务表（只需执行一次）
+   mysql -u your_username -p your_database_name < schema/task_tables.sql
+   
+   # 2. 启动调度器（注意：调度器模式会自动使用数据库存储）
+   python main.py --run_mode scheduler
+   
+   # 3. 使用命令行工具管理任务
+   
+   # 添加关键词搜索任务
+   python task_manager/cli.py add --platform xhs --type search --keywords "编程,Python" --priority 1
+   
+   # 添加创作者爬取任务
+   python task_manager/cli.py add --platform dy --type creator --ids "用户ID1,用户ID2" --scheduled_time "2025-06-21 10:00:00"
+   
+   # 添加帖子详情爬取任务
+   python task_manager/cli.py add --platform xhs --type detail --ids "帖子ID1,帖子ID2"
+   
+   # 列出所有任务
+   python task_manager/cli.py list
+   ```
+   
+   更多详细信息请查看：[任务调度系统使用指南](README_DB_TASKS.md)
 
 ## 数据保存
 - 支持关系型数据库Mysql中保存（需要提前创建数据库）

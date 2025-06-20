@@ -30,6 +30,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import bilibili as bilibili_store
 from tools import utils
 from var import crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import BilibiliClient
 from .exception import DataFetchError
@@ -42,7 +43,8 @@ class BilibiliCrawler(AbstractCrawler):
     bili_client: BilibiliClient
     browser_context: BrowserContext
 
-    def __init__(self):
+    def __init__(self, task_config: Optional[TaskConfig] = None):
+        super().__init__(task_config)
         self.index_url = "https://www.bilibili.com"
         self.user_agent = utils.get_user_agent()
 
@@ -68,32 +70,47 @@ class BilibiliCrawler(AbstractCrawler):
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url)
 
-            # Create a client to interact with the xiaohongshu website.
+            # 如果有任务配置，应用到全局配置
+            if self.task_config:
+                self._apply_task_config_to_global()
+
+            # Create a client to interact with the bilibili website.
             self.bili_client = await self.create_bilibili_client(httpx_proxy_format)
             if not await self.bili_client.pong():
+                # 优先使用任务配置中的登录信息
+                login_type = self.task_config.login_type if self.task_config else config.LOGIN_TYPE
+                cookies = self.task_config.cookies if self.task_config else config.COOKIES
+                
                 login_obj = BilibiliLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=login_type,
                     login_phone="",  # your phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES
+                    cookie_str=cookies
                 )
                 await login_obj.begin()
                 await self.bili_client.update_cookies(browser_context=self.browser_context)
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+            # 设置爬虫类型
+            crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            crawler_type_var.set(crawler_type)
+            if crawler_type == "search":
                 # Search for video and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
-                await self.get_specified_videos(config.BILI_SPECIFIED_ID_LIST)
-            elif config.CRAWLER_TYPE == "creator":
+                # 使用任务配置中的帖子ID列表或全局配置
+                post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.BILI_SPECIFIED_ID_LIST
+                await self.get_specified_videos(post_ids)
+            elif crawler_type == "creator":
+                # 使用任务配置中的创作者ID列表或全局配置
+                creator_ids = self.task_config.creator_ids if isinstance(self.task_config, CreatorTaskConfig) else config.BILI_CREATOR_ID_LIST
+                
                 if config.CREATOR_MODE:
-                    for creator_id in config.BILI_CREATOR_ID_LIST:
+                    for creator_id in creator_ids:
                         await self.get_creator_videos(int(creator_id))
                 else:
-                    await self.get_all_creator_details(config.BILI_CREATOR_ID_LIST)
+                    await self.get_all_creator_details(creator_ids)
             else:
                 pass
             utils.logger.info(
@@ -134,18 +151,42 @@ class BilibiliCrawler(AbstractCrawler):
         search bilibili video with keywords
         :return:
         """
-        utils.logger.info("[BilibiliCrawler.search] Begin search bilibli keywords")
-        bili_limit_count = 20  # bilibili limit page fixed value
-        if config.CRAWLER_MAX_NOTES_COUNT < bili_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = bili_limit_count
+        utils.logger.info("[BilibiliCrawler.search] Begin search bilibili keywords")
         start_page = config.START_PAGE  # start page number
+        pubtime_begin_s, pubtime_end_s = self.get_pubtime_datetime()
+        
+        # 使用任务配置或全局配置的搜索类型
+        search_type = ""
+        if isinstance(self.task_config, SearchTaskConfig) and hasattr(self.task_config, 'search_type'):
+            search_type = self.task_config.search_type
+        else:
+            search_type = config.SEARCH_TYPE
+            
+        # Set order by parameters based on SEARCH_TYPE value
+        if search_type == "hot":
+            search_order_type = SearchOrderType.DEFAULT
+        elif search_type == "time":
+            search_order_type = SearchOrderType.PUBDATE
+        elif search_type == "totalrank":
+            search_order_type = SearchOrderType.TOTALRANK
+        elif search_type == "danmaku":
+            search_order_type = SearchOrderType.DANMAKU
+        elif search_type == "reply":
+            search_order_type = SearchOrderType.REPLY
+        elif search_type == "view":
+            search_order_type = SearchOrderType.VIEW
+        elif search_type == "favorite":
+            search_order_type = SearchOrderType.FAVORITE
+        else:
+            search_order_type = SearchOrderType.DEFAULT
+        
         for keyword in config.KEYWORDS.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[BilibiliCrawler.search] Current search keyword: {keyword}")
             # 每个关键词最多返回 1000 条数据
             if not config.ALL_DAY:
                 page = 1
-                while (page - start_page + 1) * bili_limit_count <= config.CRAWLER_MAX_NOTES_COUNT:
+                while (page - start_page + 1) * 20 <= config.CRAWLER_MAX_NOTES_COUNT:
                     if page < start_page:
                         utils.logger.info(f"[BilibiliCrawler.search] Skip page: {page}")
                         page += 1
@@ -562,6 +603,32 @@ class BilibiliCrawler(AbstractCrawler):
                 utils.logger.error(
                     f"[BilibiliCrawler.get_followings] may be been blocked, err:{e}")
 
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            if hasattr(self.task_config, 'search_type'):
+                config.SEARCH_TYPE = self.task_config.search_type
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.BILI_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.BILI_SPECIFIED_ID_LIST = self.task_config.post_ids
+    
     async def get_dynamics(self, creator_info: Dict, semaphore: asyncio.Semaphore):
         """
         get dynamics for creator id

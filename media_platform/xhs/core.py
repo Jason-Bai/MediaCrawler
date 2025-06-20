@@ -14,13 +14,14 @@ import os
 import random
 import time
 from asyncio import Task
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from playwright.async_api import BrowserContext, BrowserType, Page, async_playwright
 from tenacity import RetryError
 
 import config
 from base.base_crawler import AbstractCrawler
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 from config import CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES
 from model.m_xiaohongshu import NoteUrlInfo
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
@@ -40,12 +41,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
     xhs_client: XiaoHongShuClient
     browser_context: BrowserContext
 
-    def __init__(self) -> None:
+    def __init__(self, task_config: Optional[TaskConfig] = None) -> None:
+        super().__init__(task_config=task_config)
         self.index_url = "https://www.xiaohongshu.com"
         # self.user_agent = utils.get_user_agent()
         self.user_agent = config.UA if config.UA else "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
     async def start(self) -> None:
+        # 如果有任务配置，应用任务配置的参数到全局变量
+        if self.task_config:
+            # 设置平台通用配置
+            self._apply_task_config_to_global()
+            
         playwright_proxy_format, httpx_proxy_format = None, None
         if config.ENABLE_IP_PROXY:
             ip_proxy_pool = await create_ip_pool(
@@ -82,34 +89,62 @@ class XiaoHongShuCrawler(AbstractCrawler):
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
             if not await self.xhs_client.pong():
                 login_obj = XiaoHongShuLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=self.task_config.login_type if self.task_config else config.LOGIN_TYPE,
                     login_phone="",  # input your phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES,
+                    cookie_str=self.task_config.cookies if self.task_config else config.COOKIES,
                 )
                 await login_obj.begin()
                 await self.xhs_client.update_cookies(
                     browser_context=self.browser_context
                 )
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+            # 设置爬虫类型
+            if self.task_config:
+                crawler_type_var.set(self.task_config.task_type)
+            else:
+                crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            if crawler_type == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_notes()
-            elif config.CRAWLER_TYPE == "creator":
+            elif crawler_type == "creator":
                 # Get creator's information and their notes and comments
                 await self.get_creators_and_notes()
             else:
-                pass
-
+                utils.logger.error(f"Invalid crawler type {crawler_type}")
             utils.logger.info("[XiaoHongShuCrawler.start] Xhs Crawler finished ...")
+                
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.XHS_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.XHS_SPECIFIED_URL_LIST = self.task_config.post_ids
 
     async def search(self) -> None:
         """Search for notes and retrieve their comment information."""
+        crawler_type_var.set("search")
         utils.logger.info(
             "[XiaoHongShuCrawler.search] Begin search xiaohongshu keywords"
         )
@@ -117,7 +152,18 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < xhs_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = xhs_limit_count
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        # 优先使用任务配置中的关键词，如果没有则使用全局配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            search_words = self.task_config.keywords
+        else:
+            search_words = str(config.KEYWORDS).strip().split(",")
+            
+        if not search_words or search_words[0] == "":
+            utils.logger.error(
+                "No search keywords provided. Please set the KEYWORDS variable."
+            )
+            return
+        for keyword in search_words:
             source_keyword_var.set(keyword)
             utils.logger.info(
                 f"[XiaoHongShuCrawler.search] Current search keyword: {keyword}"
@@ -185,10 +231,22 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
     async def get_creators_and_notes(self) -> None:
         """Get creator's notes and retrieve their comment information."""
+        crawler_type_var.set("creator")
         utils.logger.info(
             "[XiaoHongShuCrawler.get_creators_and_notes] Begin get xiaohongshu creators"
         )
-        for user_id in config.XHS_CREATOR_ID_LIST:
+        # 优先使用任务配置中的创作者ID，如果没有则使用全局配置
+        if isinstance(self.task_config, CreatorTaskConfig):
+            creators_id_list = self.task_config.creator_ids
+        else:
+            creators_id_list = config.XHS_CREATOR_ID_LIST
+            
+        if len(creators_id_list) == 0:
+            utils.logger.warning(
+                "No creators in the creators list. Please check the configuration."
+            )
+            return
+        for user_id in creators_id_list:
             # get creator detail info from web html content
             createor_info: Dict = await self.xhs_client.get_creator_info(
                 user_id=user_id
@@ -235,15 +293,30 @@ class XiaoHongShuCrawler(AbstractCrawler):
             if note_detail:
                 await xhs_store.update_xhs_note(note_detail)
 
-    async def get_specified_notes(self):
+    async def get_specified_notes(self) -> None:
         """
         Get the information and comments of the specified post
         must be specified note_id, xsec_source, xsec_token⚠️⚠️⚠️
         Returns:
 
         """
+        crawler_type_var.set("detail")
+        utils.logger.info(
+            "[XiaoHongShuCrawler.get_specified_notes] Begin get specified notes"
+        )
+        # 优先使用任务配置中的帖子ID，如果没有则使用全局配置
+        if isinstance(self.task_config, DetailTaskConfig):
+            note_url_list = self.task_config.post_ids
+        else:
+            note_url_list = config.XHS_SPECIFIED_URL_LIST
+            
+        if len(note_url_list) == 0:
+            utils.logger.warning(
+                "Empty post ID list. Please check the configuration."
+            )
+            return
         get_note_detail_task_list = []
-        for full_note_url in config.XHS_SPECIFIED_NOTE_URL_LIST:
+        for full_note_url in note_url_list:
             note_url_info: NoteUrlInfo = parse_note_info_from_note_url(full_note_url)
             utils.logger.info(
                 f"[XiaoHongShuCrawler.get_specified_notes] Parse note url info: {note_url_info}"
@@ -455,6 +528,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         utils.logger.info("[XiaoHongShuCrawler.close] Browser context closed ...")
 
     async def get_notice_media(self, note_detail: Dict):
+        # 使用任务配置或全局配置来决定是否获取图片
         if not config.ENABLE_GET_IMAGES:
             utils.logger.info(
                 f"[XiaoHongShuCrawler.get_notice_media] Crawling image mode is not enabled"
@@ -469,6 +543,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         :param note_item:
         :return:
         """
+        # 使用任务配置或全局配置来决定是否获取图片
         if not config.ENABLE_GET_IMAGES:
             return
         note_id = note_item.get("note_id")
@@ -498,6 +573,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         :param note_item:
         :return:
         """
+        # 使用任务配置或全局配置来决定是否获取图片
         if not config.ENABLE_GET_IMAGES:
             return
         note_id = note_item.get("note_id")

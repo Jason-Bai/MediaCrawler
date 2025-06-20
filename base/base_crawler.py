@@ -10,16 +10,26 @@
 
 
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Dict, Optional, Union
 
 from playwright.async_api import BrowserContext, BrowserType
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 
 class AbstractCrawler(ABC):
+    def __init__(self, task_config: Optional[TaskConfig] = None):
+        """
+        初始化爬虫
+        
+        Args:
+            task_config: 任务配置，如果为None则使用全局配置
+        """
+        self.task_config = task_config
+        
     @abstractmethod
     async def start(self):
         """
-        start crawler
+        启动爬虫
         """
         pass
 

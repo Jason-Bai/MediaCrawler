@@ -11,6 +11,7 @@
 
 import asyncio
 import sys
+import time
 
 import cmd_arg
 import config
@@ -23,6 +24,8 @@ from media_platform.tieba import TieBaCrawler
 from media_platform.weibo import WeiboCrawler
 from media_platform.xhs import XiaoHongShuCrawler
 from media_platform.zhihu import ZhihuCrawler
+from task_manager.scheduler import start_scheduler, stop_scheduler
+from tools import utils
 
 
 class CrawlerFactory:
@@ -37,32 +40,62 @@ class CrawlerFactory:
     }
 
     @staticmethod
-    def create_crawler(platform: str) -> AbstractCrawler:
+    def create_crawler(platform: str, task_config=None) -> AbstractCrawler:
+        """
+        创建爬虫实例
+        
+        Args:
+            platform: 平台名称
+            task_config: 任务配置对象，如果提供则使用此配置，否则使用全局配置
+            
+        Returns:
+            AbstractCrawler: 爬虫实例
+            
+        Raises:
+            ValueError: 如果平台不受支持
+        """
         crawler_class = CrawlerFactory.CRAWLERS.get(platform)
         if not crawler_class:
             raise ValueError("Invalid Media Platform Currently only supported xhs or dy or ks or bili ...")
-        return crawler_class()
+        return crawler_class(task_config=task_config)
 
 
 async def main():
     # parse cmd
     await cmd_arg.parse_cmd()
 
+    # 确保调度器模式下使用数据库存储
+    if config.RUN_MODE == "scheduler" and config.SAVE_DATA_OPTION != "db":
+        utils.logger.warning("调度器模式必须使用数据库存储！自动将SAVE_DATA_OPTION设置为'db'")
+        config.SAVE_DATA_OPTION = "db"
+
     # init db
     if config.SAVE_DATA_OPTION == "db":
         await db.init_db()
-
-    crawler = CrawlerFactory.create_crawler(platform=config.PLATFORM)
-    await crawler.start()
+    
+    # 根据运行模式执行不同的逻辑
+    if config.RUN_MODE == "scheduler":
+        utils.logger.info("Starting in scheduler mode...")
+        try:
+            # 启动任务调度器
+            await start_scheduler()
+        except KeyboardInterrupt:
+            utils.logger.info("Scheduler stopped by user")
+            stop_scheduler()
+    else:
+        # 传统模式：直接运行单个爬虫任务
+        utils.logger.info(f"Starting in crawler mode for {config.PLATFORM}...")
+        crawler = CrawlerFactory.create_crawler(platform=config.PLATFORM)
+        await crawler.start()
 
     if config.SAVE_DATA_OPTION == "db":
         await db.close()
 
-    
 
 if __name__ == '__main__':
     try:
         # asyncio.run(main())
         asyncio.get_event_loop().run_until_complete(main())
     except KeyboardInterrupt:
+        utils.logger.info("Program stopped by user")
         sys.exit()

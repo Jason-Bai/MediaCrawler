@@ -24,6 +24,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
 from var import crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import DOUYINClient
 from .exception import DataFetchError
@@ -36,7 +37,8 @@ class DouYinCrawler(AbstractCrawler):
     dy_client: DOUYINClient
     browser_context: BrowserContext
 
-    def __init__(self) -> None:
+    def __init__(self, task_config: Optional[TaskConfig] = None) -> None:
+        super().__init__(task_config)
         self.index_url = "https://www.douyin.com"
 
     async def start(self) -> None:
@@ -60,25 +62,36 @@ class DouYinCrawler(AbstractCrawler):
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url)
 
+            # 如果有任务配置，应用到全局配置
+            if self.task_config:
+                self._apply_task_config_to_global()
+                
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             if not await self.dy_client.pong(browser_context=self.browser_context):
+                login_type = self.task_config.login_type if self.task_config else config.LOGIN_TYPE
+                cookies = self.task_config.cookies if self.task_config else config.COOKIES
+                
                 login_obj = DouYinLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=login_type,
                     login_phone="",  # you phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES
+                    cookie_str=cookies
                 )
                 await login_obj.begin()
                 await self.dy_client.update_cookies(browser_context=self.browser_context)
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+                
+            # 设置爬虫类型
+            crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            crawler_type_var.set(crawler_type)
+            
+            if crawler_type == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_awemes()
-            elif config.CRAWLER_TYPE == "creator":
+            elif crawler_type == "creator":
                 # Get the information and comments of the specified creator
                 await self.get_creators_and_videos()
 
@@ -90,7 +103,10 @@ class DouYinCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
-        for keyword in config.KEYWORDS.split(","):
+        
+        # 使用任务配置或全局配置的关键词
+        keywords = self.task_config.keywords_str if isinstance(self.task_config, SearchTaskConfig) else config.KEYWORDS
+        for keyword in keywords.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             aweme_list: List[str] = []
@@ -132,17 +148,22 @@ class DouYinCrawler(AbstractCrawler):
             utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
             await self.batch_get_note_comments(aweme_list)
 
-    async def get_specified_awemes(self):
+    async def get_specified_awemes(self) -> None:
         """Get the information and comments of the specified post"""
+        utils.logger.info("[DouYinCrawler.get_specified_awemes] Begin get specified awemes")
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        
+        # 使用任务配置或全局配置的帖子ID列表
+        post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.DOUYIN_SPECIFIED_URL_LIST
+        
         task_list = [
-            self.get_aweme_detail(aweme_id=aweme_id, semaphore=semaphore) for aweme_id in config.DY_SPECIFIED_ID_LIST
+            self.get_aweme_detail(aweme_id, semaphore) for aweme_id in post_ids
         ]
         aweme_details = await asyncio.gather(*task_list)
         for aweme_detail in aweme_details:
             if aweme_detail is not None:
                 await douyin_store.update_douyin_aweme(aweme_detail)
-        await self.batch_get_note_comments(config.DY_SPECIFIED_ID_LIST)
+        await self.batch_get_note_comments(post_ids)
 
     async def get_aweme_detail(self, aweme_id: str, semaphore: asyncio.Semaphore) -> Any:
         """Get note detail"""
@@ -194,8 +215,12 @@ class DouYinCrawler(AbstractCrawler):
         """
         Get the information and videos of the specified creator
         """
-        utils.logger.info("[DouYinCrawler.get_creators_and_videos] Begin get douyin creators")
-        for user_id in config.DY_CREATOR_ID_LIST:
+        utils.logger.info("[DouYinCrawler.get_creators_and_videos] Begin get creators and videos")
+        
+        # 使用任务配置或全局配置的创作者ID列表
+        creator_ids = self.task_config.creator_ids if isinstance(self.task_config, CreatorTaskConfig) else config.DY_CREATOR_ID_LIST
+        
+        for user_id in creator_ids:
             creator_info: Dict = await self.dy_client.get_user_info(user_id)
             if creator_info:
                 await douyin_store.save_creator(user_id, creator=creator_info)
@@ -282,6 +307,30 @@ class DouYinCrawler(AbstractCrawler):
             )
             return browser_context
 
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.DY_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.DOUYIN_SPECIFIED_URL_LIST = self.task_config.post_ids
+    
     async def close(self) -> None:
         """Close browser context"""
         await self.browser_context.close()

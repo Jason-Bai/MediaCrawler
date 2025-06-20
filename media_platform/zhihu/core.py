@@ -27,6 +27,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import zhihu as zhihu_store
 from tools import utils
 from var import crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import ZhiHuClient
 from .exception import DataFetchError
@@ -39,7 +40,8 @@ class ZhihuCrawler(AbstractCrawler):
     zhihu_client: ZhiHuClient
     browser_context: BrowserContext
 
-    def __init__(self) -> None:
+    def __init__(self, task_config: Optional[TaskConfig] = None) -> None:
+        super().__init__(task_config)
         self.index_url = "https://www.zhihu.com"
         # self.user_agent = utils.get_user_agent()
         self.user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -72,15 +74,23 @@ class ZhihuCrawler(AbstractCrawler):
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.index_url, wait_until="domcontentloaded")
 
+            # 如果有任务配置，应用到全局配置
+            if self.task_config:
+                self._apply_task_config_to_global()
+                
             # Create a client to interact with the zhihu website.
             self.zhihu_client = await self.create_zhihu_client(httpx_proxy_format)
             if not await self.zhihu_client.pong():
+                # 优先使用任务配置中的登录信息
+                login_type = self.task_config.login_type if self.task_config else config.LOGIN_TYPE
+                cookies = self.task_config.cookies if self.task_config else config.COOKIES
+                
                 login_obj = ZhiHuLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=login_type,
                     login_phone="",  # input your phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES
+                    cookie_str=cookies
                 )
                 await login_obj.begin()
                 await self.zhihu_client.update_cookies(browser_context=self.browser_context)
@@ -91,14 +101,16 @@ class ZhihuCrawler(AbstractCrawler):
             await asyncio.sleep(5)
             await self.zhihu_client.update_cookies(browser_context=self.browser_context)
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+            # 设置爬虫类型
+            crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            crawler_type_var.set(crawler_type)
+            if crawler_type == "search":
                 # Search for notes and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_notes()
-            elif config.CRAWLER_TYPE == "creator":
+            elif crawler_type == "creator":
                 # Get creator's information and their notes and comments
                 await self.get_creators_and_notes()
             else:
@@ -107,13 +119,19 @@ class ZhihuCrawler(AbstractCrawler):
             utils.logger.info("[ZhihuCrawler.start] Zhihu Crawler finished ...")
 
     async def search(self) -> None:
-        """Search for notes and retrieve their comment information."""
+        """
+        Search for notes and retrieve their comment information.
+        """
         utils.logger.info("[ZhihuCrawler.search] Begin search zhihu keywords")
+        
+        # 使用任务配置或全局配置的关键词
+        keywords = self.task_config.keywords_str if isinstance(self.task_config, SearchTaskConfig) else config.KEYWORDS
+        
         zhihu_limit_count = 20  # zhihu limit page fixed value
         if config.CRAWLER_MAX_NOTES_COUNT < zhihu_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = zhihu_limit_count
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        for keyword in keywords.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[ZhihuCrawler.search] Current search keyword: {keyword}")
             page = 1
@@ -187,10 +205,14 @@ class ZhihuCrawler(AbstractCrawler):
         Returns:
 
         """
-        utils.logger.info("[ZhihuCrawler.get_creators_and_notes] Begin get xiaohongshu creators")
-        for user_link in config.ZHIHU_CREATOR_URL_LIST:
-            utils.logger.info(f"[ZhihuCrawler.get_creators_and_notes] Begin get creator {user_link}")
-            user_url_token = user_link.split("/")[-1]
+        utils.logger.info("[ZhihuCrawler.get_creators_and_notes] Begin get zhihu creators")
+        
+        # 使用任务配置或全局配置的创作者ID列表
+        creator_ids = self.task_config.creator_ids if isinstance(self.task_config, CreatorTaskConfig) else config.ZHIHU_CREATOR_ID_LIST
+        
+        for user_id in creator_ids:
+            utils.logger.info(f"[ZhihuCrawler.get_creators_and_notes] Begin get creator {user_id}")
+            user_url_token = user_id
             # get creator detail info from web html content
             createor_info: ZhihuCreator = await self.zhihu_client.get_creator_info(url_token=user_url_token)
             if not createor_info:
@@ -267,14 +289,19 @@ class ZhihuCrawler(AbstractCrawler):
                 )
                 return await self.zhihu_client.get_video_info(video_id)
 
-    async def get_specified_notes(self):
+    async def get_specified_notes(self) -> None:
         """
         Get the information and comments of the specified post
         Returns:
 
         """
+        utils.logger.info("[ZhihuCrawler.get_specified_notes] Begin get notes...")
+        
+        # 使用任务配置或全局配置的帖子URL列表
+        post_urls = self.task_config.post_urls if isinstance(self.task_config, DetailTaskConfig) else config.ZHIHU_SPECIFIED_ID_LIST
+
         get_note_detail_task_list = []
-        for full_note_url in config.ZHIHU_SPECIFIED_ID_LIST:
+        for full_note_url in post_urls:
             # remove query params
             full_note_url = full_note_url.split("?")[0]
             crawler_task = self.get_note_detail(
@@ -287,8 +314,10 @@ class ZhihuCrawler(AbstractCrawler):
         note_details = await asyncio.gather(*get_note_detail_task_list)
         for index, note_detail in enumerate(note_details):
             if not note_detail:
+                # 使用任务配置或全局配置的帖子URL列表
+                post_urls = self.task_config.post_urls if isinstance(self.task_config, DetailTaskConfig) else config.ZHIHU_SPECIFIED_ID_LIST
                 utils.logger.info(
-                    f"[ZhihuCrawler.get_specified_notes] Note {config.ZHIHU_SPECIFIED_ID_LIST[index]} not found"
+                    f"[ZhihuCrawler.get_specified_notes] Note {post_urls[index]} not found"
                 )
                 continue
 
@@ -365,6 +394,30 @@ class ZhihuCrawler(AbstractCrawler):
             )
             return browser_context
 
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.ZHIHU_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.ZHIHU_SPECIFIED_ID_LIST = self.task_config.post_urls
+    
     async def close(self):
         """Close browser context"""
         await self.browser_context.close()

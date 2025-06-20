@@ -30,6 +30,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import weibo as weibo_store
 from tools import utils
 from var import crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import WeiboClient
 from .exception import DataFetchError
@@ -43,7 +44,8 @@ class WeiboCrawler(AbstractCrawler):
     wb_client: WeiboClient
     browser_context: BrowserContext
 
-    def __init__(self):
+    def __init__(self, task_config: Optional[TaskConfig] = None):
+        super().__init__(task_config)
         self.index_url = "https://www.weibo.com"
         self.mobile_index_url = "https://m.weibo.cn"
         self.user_agent = utils.get_user_agent()
@@ -70,15 +72,23 @@ class WeiboCrawler(AbstractCrawler):
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(self.mobile_index_url)
 
-            # Create a client to interact with the xiaohongshu website.
+            # 如果有任务配置，应用到全局配置
+            if self.task_config:
+                self._apply_task_config_to_global()
+                
+            # Create a client to interact with the weibo website.
             self.wb_client = await self.create_weibo_client(httpx_proxy_format)
             if not await self.wb_client.pong():
+                # 优先使用任务配置中的登录信息
+                login_type = self.task_config.login_type if self.task_config else config.LOGIN_TYPE
+                cookies = self.task_config.cookies if self.task_config else config.COOKIES
+                
                 login_obj = WeiboLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=login_type,
                     login_phone="",  # your phone number
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES
+                    cookie_str=cookies
                 )
                 await login_obj.begin()
 
@@ -88,11 +98,13 @@ class WeiboCrawler(AbstractCrawler):
                 await asyncio.sleep(2)
                 await self.wb_client.update_cookies(browser_context=self.browser_context)
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+            # 设置爬虫类型
+            crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            crawler_type_var.set(crawler_type)
+            if crawler_type == "search":
                 # Search for video and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_notes()
             elif config.CRAWLER_TYPE == "creator":
@@ -108,11 +120,15 @@ class WeiboCrawler(AbstractCrawler):
         :return:
         """
         utils.logger.info("[WeiboCrawler.search] Begin search weibo keywords")
+        
+        # 使用任务配置或全局配置的关键词
+        keywords = self.task_config.keywords_str if isinstance(self.task_config, SearchTaskConfig) else config.KEYWORDS
+        
         weibo_limit_count = 10  # weibo limit page fixed value
         if config.CRAWLER_MAX_NOTES_COUNT < weibo_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = weibo_limit_count
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        for keyword in keywords.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[WeiboCrawler.search] Current search keyword: {keyword}")
             page = 1
@@ -140,21 +156,29 @@ class WeiboCrawler(AbstractCrawler):
                 page += 1
                 await self.batch_get_notes_comments(note_id_list)
 
-    async def get_specified_notes(self):
+    async def get_specified_notes(self) -> None:
         """
         get specified notes info
         :return:
         """
+        utils.logger.info("[WeiboCrawler.get_specified_notes] Begin get notes...")
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        
+        # 使用任务配置或全局配置的帖子ID列表
+        post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.WEIBO_SPECIFIED_ID_LIST
+        
         task_list = [
-            self.get_note_info_task(note_id=note_id, semaphore=semaphore) for note_id in
-            config.WEIBO_SPECIFIED_ID_LIST
+            self.get_note_info_task(note_id, semaphore)
+            for note_id in post_ids
         ]
-        video_details = await asyncio.gather(*task_list)
-        for note_item in video_details:
-            if note_item:
-                await weibo_store.update_weibo_note(note_item)
-        await self.batch_get_notes_comments(config.WEIBO_SPECIFIED_ID_LIST)
+        note_details = await asyncio.gather(*task_list)
+        for note_detail in note_details:
+            if note_detail is not None:
+                await weibo_store.update_weibo_note(note_detail)
+        
+        # 使用任务配置或全局配置的帖子ID列表
+        post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.WEIBO_SPECIFIED_ID_LIST
+        await self.batch_get_notes_comments(post_ids)
 
     async def get_note_info_task(self, note_id: str, semaphore: asyncio.Semaphore) -> Optional[Dict]:
         """
@@ -243,8 +267,12 @@ class WeiboCrawler(AbstractCrawler):
         Returns:
 
         """
-        utils.logger.info("[WeiboCrawler.get_creators_and_notes] Begin get weibo creators")
-        for user_id in config.WEIBO_CREATOR_ID_LIST:
+        utils.logger.info("[WeiboCrawler.get_creators_and_notes] Begin get creators...")
+        
+        # 使用任务配置或全局配置的创作者ID列表
+        creator_ids = self.task_config.creator_ids if isinstance(self.task_config, CreatorTaskConfig) else config.WEIBO_CREATOR_ID_LIST
+        
+        for user_id in creator_ids:
             createor_info_res: Dict = await self.wb_client.get_creator_info_by_id(creator_id=user_id)
             if createor_info_res:
                 createor_info: Dict = createor_info_res.get("userInfo", {})
@@ -330,3 +358,27 @@ class WeiboCrawler(AbstractCrawler):
                 user_agent=user_agent
             )
             return browser_context
+            
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.WEIBO_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.WEIBO_SPECIFIED_ID_LIST = self.task_config.post_ids

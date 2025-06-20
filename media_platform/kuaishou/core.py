@@ -24,6 +24,7 @@ from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import kuaishou as kuaishou_store
 from tools import utils
 from var import comment_tasks_var, crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import KuaiShouClient
 from .exception import DataFetchError
@@ -35,7 +36,8 @@ class KuaishouCrawler(AbstractCrawler):
     ks_client: KuaiShouClient
     browser_context: BrowserContext
 
-    def __init__(self):
+    def __init__(self, task_config: Optional[TaskConfig] = None):
+        super().__init__(task_config)
         self.index_url = "https://www.kuaishou.com"
         self.user_agent = utils.get_user_agent()
 
@@ -61,33 +63,42 @@ class KuaishouCrawler(AbstractCrawler):
             self.context_page = await self.browser_context.new_page()
             await self.context_page.goto(f"{self.index_url}?isHome=1")
 
+            # 如果有任务配置，应用到全局配置
+            if self.task_config:
+                self._apply_task_config_to_global()
+            
             # Create a client to interact with the kuaishou website.
             self.ks_client = await self.create_ks_client(httpx_proxy_format)
             if not await self.ks_client.pong():
+                login_type = self.task_config.login_type if self.task_config else config.LOGIN_TYPE
+                cookies = self.task_config.cookies if self.task_config else config.COOKIES
+                
                 login_obj = KuaishouLogin(
-                    login_type=config.LOGIN_TYPE,
+                    login_type=login_type,
                     login_phone=httpx_proxy_format,
                     browser_context=self.browser_context,
                     context_page=self.context_page,
-                    cookie_str=config.COOKIES,
+                    cookie_str=cookies,
                 )
                 await login_obj.begin()
                 await self.ks_client.update_cookies(
                     browser_context=self.browser_context
                 )
 
-            crawler_type_var.set(config.CRAWLER_TYPE)
-            if config.CRAWLER_TYPE == "search":
+            # 设置爬虫类型
+            crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+            crawler_type_var.set(crawler_type)
+            if crawler_type == "search":
                 # Search for videos and retrieve their comment information.
                 await self.search()
-            elif config.CRAWLER_TYPE == "detail":
+            elif crawler_type == "detail":
                 # Get the information and comments of the specified post
                 await self.get_specified_videos()
-            elif config.CRAWLER_TYPE == "creator":
+            elif crawler_type == "creator":
                 # Get creator's information and their videos and comments
                 await self.get_creators_and_videos()
             else:
-                pass
+                utils.logger.error(f"Invalid crawler type {crawler_type}")
 
             utils.logger.info("[KuaishouCrawler.start] Kuaishou Crawler finished ...")
 
@@ -96,8 +107,11 @@ class KuaishouCrawler(AbstractCrawler):
         ks_limit_count = 20  # kuaishou limit page fixed value
         if config.CRAWLER_MAX_NOTES_COUNT < ks_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = ks_limit_count
+            
+        # 使用任务配置或全局配置的关键词
+        keywords = self.task_config.keywords_str if isinstance(self.task_config, SearchTaskConfig) else config.KEYWORDS
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        for keyword in keywords.split(","):
             search_session_id = ""
             source_keyword_var.set(keyword)
             utils.logger.info(
@@ -141,18 +155,26 @@ class KuaishouCrawler(AbstractCrawler):
                 page += 1
                 await self.batch_get_video_comments(video_id_list)
 
-    async def get_specified_videos(self):
+    async def get_specified_videos(self) -> None:
         """Get the information and comments of the specified post"""
+        utils.logger.info("[KuaishouCrawler.get_specified_videos] Begin get videos...")
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
+        
+        # 使用任务配置或全局配置的帖子ID列表
+        post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.KUAISHOU_SPECIFIED_URL_LIST
+        
         task_list = [
-            self.get_video_info_task(video_id=video_id, semaphore=semaphore)
-            for video_id in config.KS_SPECIFIED_ID_LIST
+            self.get_video_info_task(video_id, semaphore)
+            for video_id in post_ids
         ]
-        video_details = await asyncio.gather(*task_list)
-        for video_detail in video_details:
-            if video_detail is not None:
-                await kuaishou_store.update_kuaishou_video(video_detail)
-        await self.batch_get_video_comments(config.KS_SPECIFIED_ID_LIST)
+        note_details = await asyncio.gather(*task_list)
+        for note_detail in note_details:
+            if note_detail is not None:
+                await kuaishou_store.update_kuaishou_video(note_detail)
+                
+        # 使用任务配置或全局配置的帖子ID列表
+        post_ids = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.KUAISHOU_SPECIFIED_URL_LIST
+        await self.batch_get_video_comments(post_ids)
 
     async def get_video_info_task(
         self, video_id: str, semaphore: asyncio.Semaphore
@@ -312,7 +334,11 @@ class KuaishouCrawler(AbstractCrawler):
         utils.logger.info(
             "[KuaiShouCrawler.get_creators_and_videos] Begin get kuaishou creators"
         )
-        for user_id in config.KS_CREATOR_ID_LIST:
+        
+        # 使用任务配置或全局配置的创作者ID列表
+        creator_ids = self.task_config.creator_ids if isinstance(self.task_config, CreatorTaskConfig) else config.KS_CREATOR_ID_LIST
+        
+        for user_id in creator_ids:
             # get creator detail info from web html content
             createor_info: Dict = await self.ks_client.get_creator_info(user_id=user_id)
             if createor_info:
@@ -345,6 +371,30 @@ class KuaishouCrawler(AbstractCrawler):
             if video_detail is not None:
                 await kuaishou_store.update_kuaishou_video(video_detail)
 
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.KS_CREATOR_ID_LIST = self.task_config.creator_ids
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.KUAISHOU_SPECIFIED_URL_LIST = self.task_config.post_ids
+    
     async def close(self):
         """Close browser context"""
         await self.browser_context.close()

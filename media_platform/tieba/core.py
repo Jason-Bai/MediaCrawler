@@ -26,6 +26,7 @@ from store import tieba as tieba_store
 from tools import utils
 from tools.crawler_util import format_proxy_info
 from var import crawler_type_var, source_keyword_var
+from task_manager.task_config import TaskConfig, SearchTaskConfig, CreatorTaskConfig, DetailTaskConfig
 
 from .client import BaiduTieBaClient
 from .field import SearchNoteType, SearchSortType
@@ -38,7 +39,8 @@ class TieBaCrawler(AbstractCrawler):
     tieba_client: BaiduTieBaClient
     browser_context: BrowserContext
 
-    def __init__(self) -> None:
+    def __init__(self, task_config: Optional[TaskConfig] = None) -> None:
+        super().__init__(task_config)
         self.index_url = "https://tieba.baidu.com"
         self.user_agent = utils.get_user_agent()
         self._page_extractor = TieBaExtractor()
@@ -57,20 +59,28 @@ class TieBaCrawler(AbstractCrawler):
             _, httpx_proxy_format = format_proxy_info(ip_proxy_info)
             utils.logger.info(f"[BaiduTieBaCrawler.start] Init default ip proxy, value: {httpx_proxy_format}")
 
+        # 如果有任务配置，应用到全局配置
+        if self.task_config:
+            self._apply_task_config_to_global()
+            
         # Create a client to interact with the baidutieba website.
         self.tieba_client = BaiduTieBaClient(
             ip_pool=ip_proxy_pool,
             default_ip_proxy=httpx_proxy_format,
         )
-        crawler_type_var.set(config.CRAWLER_TYPE)
-        if config.CRAWLER_TYPE == "search":
+        
+        # 设置爬虫类型
+        crawler_type = self.task_config.task_type if self.task_config else config.CRAWLER_TYPE
+        crawler_type_var.set(crawler_type)
+        
+        if crawler_type == "search":
             # Search for notes and retrieve their comment information.
             await self.search()
             await self.get_specified_tieba_notes()
-        elif config.CRAWLER_TYPE == "detail":
+        elif crawler_type == "detail":
             # Get the information and comments of the specified post
             await self.get_specified_notes()
-        elif config.CRAWLER_TYPE == "creator":
+        elif crawler_type == "creator":
             # Get creator's information and their notes and comments
             await self.get_creators_and_notes()
         else:
@@ -89,7 +99,11 @@ class TieBaCrawler(AbstractCrawler):
         if config.CRAWLER_MAX_NOTES_COUNT < tieba_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = tieba_limit_count
         start_page = config.START_PAGE
-        for keyword in config.KEYWORDS.split(","):
+        
+        # 使用任务配置或全局配置的关键词
+        keywords = self.task_config.keywords_str if isinstance(self.task_config, SearchTaskConfig) else config.KEYWORDS
+        
+        for keyword in keywords.split(","):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[BaiduTieBaCrawler.search] Current search keyword: {keyword}")
             page = 1
@@ -146,15 +160,20 @@ class TieBaCrawler(AbstractCrawler):
                 await self.get_specified_notes([note.note_id for note in note_list])
                 page_number += tieba_limit_count
 
-    async def get_specified_notes(self, note_id_list: List[str] = config.TIEBA_SPECIFIED_ID_LIST):
+    async def get_specified_notes(self, note_id_list: List[str] = None) -> None:
         """
         Get the information and comments of the specified post
         Args:
-            note_id_list:
+            note_id_list: 可选的帖子ID列表，如果未提供则从任务配置或全局配置获取
 
         Returns:
 
         """
+        utils.logger.info("[BaiduTieBaCrawler.get_specified_notes] Begin get notes...")
+        
+        # 如果未提供note_id_list参数，则使用任务配置或全局配置中的ID列表
+        if note_id_list is None:
+            note_id_list = self.task_config.post_ids if isinstance(self.task_config, DetailTaskConfig) else config.TIEBA_SPECIFIED_ID_LIST
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         task_list = [
             self.get_note_detail_async_task(note_id=note_id, semaphore=semaphore) for note_id in note_id_list
@@ -238,8 +257,12 @@ class TieBaCrawler(AbstractCrawler):
         Returns:
 
         """
-        utils.logger.info("[WeiboCrawler.get_creators_and_notes] Begin get weibo creators")
-        for creator_url in config.TIEBA_CREATOR_URL_LIST:
+        utils.logger.info("[TieBaCrawler.get_creators_and_notes] Begin get tieba creators")
+        
+        # 使用任务配置或全局配置的创作者URL列表
+        creator_urls = self.task_config.creator_urls if isinstance(self.task_config, CreatorTaskConfig) else config.TIEBA_CREATOR_URL_LIST
+        
+        for creator_url in creator_urls:
             creator_page_html_content = await self.tieba_client.get_creator_info_by_url(creator_url=creator_url)
             creator_info: TiebaCreator = self._page_extractor.extract_creator_info(creator_page_html_content)
             if creator_info:
@@ -305,6 +328,30 @@ class TieBaCrawler(AbstractCrawler):
             )
             return browser_context
 
+    def _apply_task_config_to_global(self) -> None:
+        """将任务配置应用到全局变量"""
+        if not self.task_config:
+            return
+            
+        # 设置通用配置
+        config.PLATFORM = self.task_config.platform
+        config.CRAWLER_TYPE = self.task_config.task_type
+        config.LOGIN_TYPE = self.task_config.login_type
+        config.COOKIES = self.task_config.cookies
+        config.SAVE_DATA_OPTION = self.task_config.save_data_option
+        config.ENABLE_GET_COMMENTS = self.task_config.enable_get_comments
+        config.ENABLE_GET_SUB_COMMENTS = self.task_config.enable_get_sub_comments
+        
+        # 根据任务类型设置特定配置
+        if isinstance(self.task_config, SearchTaskConfig):
+            config.KEYWORDS = self.task_config.keywords_str
+            
+        elif isinstance(self.task_config, CreatorTaskConfig):
+            config.TIEBA_CREATOR_URL_LIST = self.task_config.creator_urls
+            
+        elif isinstance(self.task_config, DetailTaskConfig):
+            config.TIEBA_SPECIFIED_ID_LIST = self.task_config.post_ids
+    
     async def close(self):
         """
         Close browser context
